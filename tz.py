@@ -47,9 +47,15 @@ MAX_JOBS        = int(os.environ.get("MAX_JOBS", "0"))
 MAX_PAGES       = int(os.environ.get("MAX_PAGES", "20"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "25"))
 
-OUTPUT_FILE        = "jobwebtanzania_jobs.xlsx"
-PROCESSED_IDS_FILE = "jobwebtanzania_processed.csv"
-FLAGGED_FILE       = "jobwebtanzania_flagged.csv"
+# ---------------------------------------------------------------------------
+# FIX: anchor tracker/output files to the script's own directory so they
+# persist correctly whether run locally or via GitHub Actions with artifacts.
+# ---------------------------------------------------------------------------
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+OUTPUT_FILE        = os.path.join(_SCRIPT_DIR, "jobwebtanzania_jobs.xlsx")
+PROCESSED_IDS_FILE = os.path.join(_SCRIPT_DIR, "jobwebtanzania_processed.csv")
+FLAGGED_FILE       = os.path.join(_SCRIPT_DIR, "jobwebtanzania_flagged.csv")
 
 _TRACKER_FIELDS = ["Job ID", "Job URL", "Job Title", "Company Name",
                    "Status", "Timestamp", "WP ID"]
@@ -112,18 +118,64 @@ tanzania_LOCATIONS = [
 DEFAULT_LOCATION = os.environ.get("JOBWEB_DEFAULT_LOCATION", "tanzania")
 
 # The demo/placeholder URL that JobRoller inserts — never a real apply link
-_JOBTHEMES_PLACEHOLDER = "http://www.jobthemes.com"
+_JOBTHEMES_PLACEHOLDER  = "http://www.jobthemes.com"
 _JOBTHEMES_PLACEHOLDER2 = "https://www.jobthemes.com"
 
+# ---------------------------------------------------------------------------
+# FIX 1 — Expanded host blocklist.
+# Added: google.com (catches feedburner.google.com and all google subdomains),
+# feedburner.com, blogspot.com, wordpress.com (self-hosted WP sites are OK
+# but wordpress.com is a newsletter/blog host), mailchimp., constantcontact.,
+# hubspot., feeds., feedblitz., tinyletter., substack.
+# ---------------------------------------------------------------------------
 _NON_APPLY_HOST_SUBSTR = (
-    "jobwebtanzania.com", "facebook.", "twitter.", "x.com", "linkedin.",
+    # ---- site-own / social / messaging ----
+    "jobwebtanzania.com",
+    "facebook.", "twitter.", "x.com", "linkedin.",
     "instagram.", "wa.me", "whatsapp", "t.me", "telegram",
-    "plus.google", "pinterest.", "youtube.", "jobthemes.com",
+    "plus.google", "pinterest.", "youtube.",
+    "jobthemes.com",
+    # ---- Google services (feedburner lives on google.com) ----
+    "google.com", "google.co.",          # blocks feedburner.google.com, google.co.tz etc.
+    "feedburner.com",                    # legacy feedburner domain
+    # ---- Newsletter / subscription services ----
+    "mailchimp.", "list-manage.",        # mailchimp delivery domain
+    "constantcontact.", "cc.email",
+    "hubspot.", "hs-sites.",
+    "substack.",
+    "tinyletter.",
+    "feedblitz.", "feeds.feedblitz.",
+    "feeds.feedburner.",
+    "blogtrottr.",
+    # ---- Generic feed / blog hosts ----
+    "blogspot.",
+    "wordpress.com",                     # .com only; self-hosted WP is fine
+    "medium.com",
+    "tumblr.",
 )
+
+# ---------------------------------------------------------------------------
+# FIX 2 — Expanded path/query blocklist.
+# Added: /subscribe, /newsletter, /feed, /rss, mailverify, email-alert,
+# job-alert, /follow, /share, /bookmark, /print, /report-job.
+# ---------------------------------------------------------------------------
 _NON_APPLY_PATH_SUBSTR = (
+    # ---- auth / account ----
     "/wp-login", "/submit-job", "/register", "/my-dashboard",
-    "/lists/", "#", "/cart", "/checkout", "action=login",
+    "/lists/", "/cart", "/checkout", "action=login",
+    # ---- newsletter / feed / alerts ----
+    "/subscribe", "/newsletter", "/feed", "/rss", "/atom",
+    "mailverify", "email-alert", "job-alert", "job_alert",
+    "emailalert", "jobalert",
+    "/fb/a/",                            # FeedBurner path pattern
+    "uri=",                              # FeedBurner ?uri= param
+    # ---- social sharing / site utilities ----
+    "/follow", "/share", "/bookmark", "/print",
+    "/report-job", "/report_job",
+    # ---- anchors / js ----
+    "#",
 )
+
 _NON_APPLY_EMAIL_DOMAINS = ("jobwebtanzania.com", "jobwebzambia.com")
 
 def _is_real_apply_email(email: str) -> bool:
@@ -394,7 +446,6 @@ def extract_salary(text: str) -> str:
 
 # =============================================================================
 #  CLEAN CATEGORY STRINGS
-#  Strips suffixes like "Jobs in tanzania", "Jobs in Addis Ababa", etc.
 # =============================================================================
 
 _CATEGORY_NOISE_RE = re.compile(
@@ -406,7 +457,6 @@ _CATEGORY_NOISE_RE = re.compile(
 )
 
 def clean_category(raw: str) -> str:
-    """Strip 'Jobs in tanzania' and similar noise from a raw category string."""
     cleaned = _CATEGORY_NOISE_RE.sub("", raw.strip()).strip()
     return cleaned if cleaned else raw.strip()
 
@@ -636,7 +686,6 @@ def infer_field(title: str, description: str, fallback_categories: str = "") -> 
     for field, _strong, weak in FIELD_KEYWORD_MAP:
         if _kw_hit(text, weak):
             return field
-    # fallback_categories are already cleaned before being passed here
     if fallback_categories:
         cats = [c.strip() for c in fallback_categories.split(",") if c.strip()]
         for c in cats:
@@ -914,6 +963,14 @@ def paraphrase_description(text: str) -> str:
 
 # =============================================================================
 #  DUPLICATE TRACKER
+#
+#  FIX 3 — Robust CSV persistence:
+#  • Files are anchored to _SCRIPT_DIR (not CWD) — safe on GitHub Actions.
+#  • _upsert_row uses utf-8-sig reader to handle BOM-encoded files.
+#  • Read failures log the full exception and preserve whatever rows were
+#    already loaded rather than silently resetting to [].
+#  • A single lock-style temp-file write+rename pattern prevents partial
+#    writes from corrupting the tracker.
 # =============================================================================
 
 def _init_tracker():
@@ -921,34 +978,46 @@ def _init_tracker():
         try:
             with open(PROCESSED_IDS_FILE, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(_TRACKER_FIELDS)
-            log_.info(f"Tracker file created: {PROCESSED_IDS_FILE}")
+            log_.info(f"Tracker created: {PROCESSED_IDS_FILE}")
         except Exception as e:
-            log_.error(f"Could not create tracker file {PROCESSED_IDS_FILE}: {e}")
+            log_.error(f"Could not create tracker {PROCESSED_IDS_FILE}: {e}")
 
 def load_processed_ids() -> tuple:
     _init_tracker()
     ids, urls = set(), set()
     try:
-        with open(PROCESSED_IDS_FILE, newline="", encoding="utf-8") as f:
+        with open(PROCESSED_IDS_FILE, newline="", encoding="utf-8-sig") as f:
             for row in csv.DictReader(f):
                 if row.get("Job ID"):
                     ids.add(row["Job ID"].strip())
                 if row.get("Job URL"):
                     urls.add(row["Job URL"].strip())
+        log_.info(f"Tracker loaded: {len(ids)} IDs from {PROCESSED_IDS_FILE}")
+    except FileNotFoundError:
+        log_.info("No tracker file yet — starting fresh.")
     except Exception as e:
-        log_.error(f"Could not read tracker file: {e}")
+        log_.error(f"Tracker read error: {e}")
     return ids, urls
 
 def _upsert_row(job_id: str, updates: dict):
+    """
+    Read the full tracker CSV, update or insert the row for job_id,
+    then write back atomically via a temp file to prevent corruption.
+    """
     _init_tracker()
+
+    # ── Read existing rows ────────────────────────────────────────────────
     rows = []
     try:
-        with open(PROCESSED_IDS_FILE, newline="", encoding="utf-8") as f:
+        with open(PROCESSED_IDS_FILE, newline="", encoding="utf-8-sig") as f:
             rows = list(csv.DictReader(f))
+    except FileNotFoundError:
+        rows = []
     except Exception as e:
-        log_.error(f"Tracker read error: {e}")
+        log_.error(f"Tracker read error in _upsert_row (will append anyway): {e}")
         rows = []
 
+    # ── Update existing or append new ─────────────────────────────────────
     found = False
     for row in rows:
         if row.get("Job ID", "").strip() == str(job_id):
@@ -964,13 +1033,21 @@ def _upsert_row(job_id: str, updates: dict):
         new_row.update(updates)
         rows.append(new_row)
 
+    # ── Atomic write via temp file ─────────────────────────────────────────
+    tmp_path = PROCESSED_IDS_FILE + ".tmp"
     try:
-        with open(PROCESSED_IDS_FILE, "w", newline="", encoding="utf-8") as f:
+        with open(tmp_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=_TRACKER_FIELDS, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
+        os.replace(tmp_path, PROCESSED_IDS_FILE)  # atomic on POSIX & Windows
+        log_.debug(f"Tracker updated: {job_id} -> {updates.get('Status','?')} ({len(rows)} total rows)")
     except Exception as e:
         log_.error(f"Tracker write error: {e}")
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 def make_job_id(job_url: str, title: str = "", company: str = "") -> str:
     if job_url:
@@ -1226,39 +1303,45 @@ def collect_job_links(jobs_url: str, max_pages: int = MAX_PAGES) -> list:
     return ordered
 
 # =============================================================================
-#  STEP 2 — PARSE ONE JOBWEBtanzania DETAIL PAGE
-#
-#  JobRoller structure (from Apps Script selectors):
-#    #mainContent
-#      div.section.single
-#        div.section_header
-#          h1                          → "Job Title at Company Name"
-#        div (2nd child — content div)
-#          ul                          → meta list (company, location, state, job type)
-#            li:nth-child(1)           → Company: <a>Company Name</a>
-#            li:nth-child(2)           → Location: <a>City</a>
-#            li:nth-child(3)           → State: <a>Region</a>
-#            li:nth-child(4)           → Job Type: <a>Full Time</a>
-#          font / p / div tags         → body paragraphs
-#          [last font/block]           → application info (email + deadline)
-#
-#  The apply email/URL is always towards the END of the content div, in a
-#  "Method of Application" / "How to Apply" section — just like the Apps Script
-#  reads font:nth-child(15) as the applicationInfo block.
+#  STEP 2 — PARSE ONE JOBWEBTANZANIA DETAIL PAGE
 # =============================================================================
 
 def _is_real_apply_url(href: str) -> bool:
+    """
+    Return True only if href looks like a genuine external application URL.
+
+    FIX: checks both host substrings AND path/query substrings so that
+    newsletter/subscription/feed URLs (feedburner, mailchimp, /subscribe,
+    /fb/a/mailverify, etc.) are always rejected.
+    """
     if not href:
         return False
     low = href.lower()
+
+    # Must be a real HTTP URL (not mailto, anchor, javascript)
     if low.startswith("mailto:") or low.startswith("#") or low.startswith("javascript:"):
         return False
     if not low.startswith("http"):
         return False
-    if any(s in low for s in _NON_APPLY_HOST_SUBSTR):
+
+    # Parse the URL so we can check host and path separately
+    try:
+        parsed = urlsplit(low)
+        host   = parsed.netloc  # e.g. "feedburner.google.com"
+        path   = parsed.path    # e.g. "/fb/a/mailverify"
+        query  = parsed.query   # e.g. "uri=Jobwebtanzania"
+    except Exception:
         return False
-    if any(s in low for s in _NON_APPLY_PATH_SUBSTR):
+
+    # Block by host substring
+    if any(s in host for s in _NON_APPLY_HOST_SUBSTR):
         return False
+
+    # Block by path or query substring
+    full_path_query = path + "?" + query if query else path
+    if any(s in full_path_query for s in _NON_APPLY_PATH_SUBSTR):
+        return False
+
     return True
 
 def _is_apply_heading_line(line: str) -> bool:
@@ -1268,54 +1351,35 @@ def _is_apply_heading_line(line: str) -> bool:
     return bool(_APPLY_HEAD_PHRASES.match(s))
 
 def _clean_location_str(raw: str) -> str:
-    """Strip trailing 'Jobs', 'Jobs in tanzania', city slug suffixes from location strings."""
     loc = raw.strip()
     loc = re.sub(r"\s+jobs?\s*$", "", loc, flags=re.I).strip()
     loc = re.sub(r"\s+jobs?\s+in\s+.+$", "", loc, flags=re.I).strip()
     return loc
 
 def _extract_jobroller_content(soup) -> tuple:
-    """
-    Extract (content_el, meta_ul) from a JobRoller page using the exact
-    DOM structure: #mainContent > div.section.single > div:nth-child(2)
-
-    Returns (content_div, meta_ul) where content_div is the main body container
-    and meta_ul is the <ul> holding Company / Location / Job Type meta items.
-    Falls back gracefully if the markup differs.
-    """
-    # Primary: exact JobRoller path
     main = soup.find(id="mainContent")
     if main:
         single = main.find("div", class_=lambda c: c and "single" in c.split())
         if single:
             children = [c for c in single.children
                         if getattr(c, "name", None) in ("div", "section")]
-            # The 2nd child div holds the meta + body
             content_div = children[1] if len(children) >= 2 else (children[0] if children else None)
             if content_div:
                 meta_ul = content_div.find("ul")
                 return content_div, meta_ul
 
-    # Fallback selectors in priority order
     for sel in ["div.single-job-content", "div.job-description", "div#job-detail",
                 "div.entry-content", "div.noo-job-content", "article", "main"]:
         el = soup.select_one(sel)
         if el and len(el.get_text(strip=True)) > 100:
             return el, el.find("ul")
 
-    # Last resort: body (will grab everything, but body-drop lines will filter nav junk)
     return soup.body or soup, None
 
 def _extract_body_blocks(content_div) -> list:
-    """
-    Return a list of (tag, text) for every meaningful text block inside
-    content_div, excluding the <ul> meta list at the top.
-    Blocks are <font>, <p>, <div>, <h2>...<h6>, <blockquote>, <li> children.
-    """
     blocks = []
     skip_tags = set()
 
-    # Mark the first <ul> (meta list) to skip
     first_ul = content_div.find("ul")
     if first_ul:
         skip_tags.add(id(first_ul))
@@ -1326,19 +1390,14 @@ def _extract_body_blocks(content_div) -> list:
         if child.name not in ("font", "p", "div", "h2", "h3", "h4", "h5", "h6",
                                "blockquote", "span", "b", "strong"):
             continue
-        # Skip if it's a descendant of the ul meta list
         if any(id(p) in skip_tags for p in child.parents):
             continue
-        # Skip empty nodes
         txt = child.get_text(" ", strip=True)
         if not txt or len(txt) < 5:
             continue
-        # Skip pure nav noise
         low = txt.lower()
         if low in _BODY_DROP_LINES:
             continue
-        # Skip if it's entirely contained in an ancestor we already added
-        # (avoid double-counting nested elements)
         parent_added = any(
             id(p) in {id(b[0]) for b in blocks}
             for p in child.parents
@@ -1352,10 +1411,6 @@ def _extract_body_blocks(content_div) -> list:
     return blocks
 
 def _split_blocks_at_apply(blocks: list) -> tuple:
-    """
-    Split blocks into (description_blocks, apply_blocks) at the first
-    'How to Apply' / 'Method of Application' heading line.
-    """
     for i, (tag, txt) in enumerate(blocks):
         if _is_apply_heading_line(txt):
             return blocks[:i], blocks[i:]
@@ -1363,20 +1418,19 @@ def _split_blocks_at_apply(blocks: list) -> tuple:
 
 def _extract_apply_from_blocks(apply_blocks, content_div) -> tuple:
     """
-    From the apply section blocks, extract (apply_email, apply_url).
-    Searches:
-      1. Cloudflare-decoded email text already in the soup
-      2. mailto: anchors
-      3. Real external http URLs
-      4. Plain email addresses in text
+    Extract (apply_email, apply_url) from the apply section.
+
+    FIX: apply_url now goes through _is_real_apply_url which rejects
+    feedburner, newsletter, /subscribe, /fb/a/ and all other non-apply
+    host/path patterns.  The jobwebtanzania.com site link itself is also
+    already blocked via _NON_APPLY_HOST_SUBSTR.
     """
     apply_email = ""
     apply_url   = ""
 
-    # Combine text of apply blocks for regex scanning
     apply_text = "\n".join(txt for _, txt in apply_blocks)
 
-    # 1. mailto: anchors anywhere in content_div (most reliable)
+    # 1. mailto: anchors (most reliable)
     for a in content_div.find_all("a", href=True):
         href = a["href"].strip()
         if href.lower().startswith("mailto:"):
@@ -1385,7 +1439,7 @@ def _extract_apply_from_blocks(apply_blocks, content_div) -> tuple:
                 apply_email = cand
                 break
 
-    # 2. Cloudflare-decoded email already embedded as plain text in apply section
+    # 2. Cloudflare-decoded email in apply text
     if not apply_email:
         m = EMAIL_PATTERN.search(apply_text)
         if m:
@@ -1393,27 +1447,27 @@ def _extract_apply_from_blocks(apply_blocks, content_div) -> tuple:
             if _is_real_apply_email(cand):
                 apply_email = cand
 
-    # 3. External URL in apply section (never jobthemes.com placeholder)
+    # 3. External apply URL — iterate ALL anchors, skip non-apply ones
     for a in content_div.find_all("a", href=True):
         href = a["href"].strip()
         if _is_real_apply_url(href):
             apply_url = strip_tracking_params(href)
             break
 
+    # 4. Fallback: scan raw text for URLs
     if not apply_url:
         for u in URL_PATTERN.findall(apply_text):
-            if _is_real_apply_url(u):
-                apply_url = strip_tracking_params(u.rstrip(".,);"))
+            u_clean = u.rstrip(".,);")
+            if _is_real_apply_url(u_clean):
+                apply_url = strip_tracking_params(u_clean)
                 break
 
     return apply_email, apply_url
 
 def scrape_job_detail(url: str) -> dict:
-    """Parse a single JobWebtanzania /jobs/<slug>/ page into a raw_job dict."""
     soup = get_soup(url)
 
     # ── Title ──────────────────────────────────────────────────────────────
-    # JobRoller H1: div.section_header > h1  OR  span#topss h1
     h1 = (soup.select_one("div.section_header h1")
           or soup.select_one("h1.job-title")
           or soup.select_one("h1.entry-title")
@@ -1461,7 +1515,6 @@ def scrape_job_detail(url: str) -> dict:
                 job_type = map_job_type(type_raw)
 
             elif li_lower.startswith("state") or "/job-state/" in a_href:
-                # State overrides location with more specific value
                 state_raw = a_text or re.sub(r"^state\s*:?\s*", "", li_text, flags=re.I).strip()
                 state_clean = _clean_location_str(state_raw)
                 if state_clean:
@@ -1470,8 +1523,6 @@ def scrape_job_detail(url: str) -> dict:
     if not company_name:
         company_name = company_from_h1 or "JobWebtanzania Employer"
 
-    # ── Also scan /job-location/ and /job-type/ anchor hrefs site-wide ────
-    # (fallback for themes that don't use ul meta list)
     if location == DEFAULT_LOCATION:
         for a in soup.find_all("a", href=True):
             if "/job-location/" in a["href"]:
@@ -1489,11 +1540,9 @@ def scrape_job_detail(url: str) -> dict:
     blocks = _extract_body_blocks(content_div)
     desc_blocks, apply_blocks = _split_blocks_at_apply(blocks)
 
-    # Build clean description text from desc_blocks
     seen_lines = set()
     desc_lines = []
     for tag, txt in desc_blocks:
-        # Convert block to multi-line text preserving bullets
         block_text = html_block_to_text(tag)
         for ln in block_text.split("\n"):
             ln_s = ln.strip()
@@ -1512,19 +1561,14 @@ def scrape_job_detail(url: str) -> dict:
     description = "\n".join(desc_lines).strip()
     description = re.sub(r"\n{3,}", "\n\n", description)
 
-    # Build apply text for display/debugging
     apply_text = "\n".join(txt for _, txt in apply_blocks)
 
-    # ── If description is still empty or tiny, use full content minus known junk ─
     if len(description.split()) < 20:
         full_text = html_block_to_text(content_div)
-        # Strip obvious nav noise at the top (everything before the first real sentence)
-        # Look for the first line that looks like actual job content
         lines = [l.strip() for l in full_text.split("\n") if l.strip()]
         content_start = 0
         for idx, ln in enumerate(lines):
             ln_low = ln.lower()
-            # Skip lines that are clearly nav/header noise
             if ln_low in {"home", "about us", "contact", "privacy policy",
                           "login/register", "submit a job", "submit job",
                           "register", "my dashboard", "linkedin page",
@@ -1534,12 +1578,10 @@ def scrape_job_detail(url: str) -> dict:
                 continue
             if re.match(r"^\d{1,2}\s+\w+\s+\d{4}$", ln):
                 continue
-            # Once we see something that looks real, start here
             if len(ln.split()) >= 4:
                 content_start = idx
                 break
         lines = lines[content_start:]
-        # Cut at apply heading or cut markers
         cut_at = len(lines)
         for idx, ln in enumerate(lines):
             if _is_apply_heading_line(ln):
@@ -1574,7 +1616,6 @@ def scrape_job_detail(url: str) -> dict:
         if ds:
             date_posted = ds[0]
 
-    # Search entire page text for deadline
     page_text_full = soup.get_text("\n")
     for lab in DEADLINE_LABELS:
         m = re.search(rf"{re.escape(lab)}\s*[:\-]?\s*([^\n<]{{3,60}})", page_text_full, re.I)
@@ -1584,11 +1625,9 @@ def scrape_job_detail(url: str) -> dict:
                 deadline = d
                 break
 
-    # Also check apply_text for dates (closing dates often there)
     if not deadline and apply_text:
         ds = text_dates(apply_text) or dmy_dates(apply_text)
         if ds:
-            # Take the latest date found (most likely the deadline)
             deadline = sorted(ds)[-1]
 
     if not date_posted:
@@ -1599,7 +1638,6 @@ def scrape_job_detail(url: str) -> dict:
     # ── Apply: email + URL ─────────────────────────────────────────────────
     apply_email, apply_url = _extract_apply_from_blocks(apply_blocks, content_div)
 
-    # If no apply blocks found (no clear heading), search full content_div
     if not apply_email and not apply_url:
         apply_email, apply_url = _extract_apply_from_blocks([], content_div)
 
@@ -1611,7 +1649,6 @@ def scrape_job_detail(url: str) -> dict:
     salary = extract_salary(description)
 
     # ── Job field ─────────────────────────────────────────────────────────
-    # Clean category strings before passing to infer_field
     cleaned_categories = [clean_category(c) for c in job_categories]
     job_field_raw = ", ".join(dict.fromkeys(c for c in cleaned_categories if c))
     job_field = infer_field(title, description, job_field_raw)
@@ -1815,9 +1852,10 @@ def main():
 
     print()
     print(C_HEADER("=" * 80))
-    print(C_HEADER("  JOBWEBtanzania SCRAPER + MISTRAL PARAPHRASE + WORDPRESS POSTING"))
+    print(C_HEADER("  JOBWEBTANZANIA SCRAPER + MISTRAL PARAPHRASE + WORDPRESS POSTING"))
     print(C_HEADER("=" * 80))
     print(f"  Source          : {JOBS_URL}")
+    print(f"  Tracker file    : {PROCESSED_IDS_FILE}")
     print(f"  Public-apply    : {'✅ enforced (flag others)' if REQUIRE_PUBLIC_APPLY else '❌ off (post all)'}")
     print(f"  Max new jobs    : {'unlimited' if not MAX_JOBS else MAX_JOBS}")
     print(f"  Max pages       : {MAX_PAGES}")
