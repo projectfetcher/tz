@@ -10,7 +10,7 @@ on:
         default: ''
 
 concurrency:
-  group: ethiojobs-scraper
+  group: jobwebtanzania-scraper
   cancel-in-progress: false
 
 jobs:
@@ -33,12 +33,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ethiojobs_ethiopia_processed.csv
-            ethiojobs_ethiopia_flagged.csv
-            ethiojobs_api_cache.json
-          key: ethiojobs-tracker-${{ github.run_id }}
+            jobwebtanzania_processed.csv
+            jobwebtanzania_flagged.csv
+            jobwebtanzania_api_cache.json
+          key: jobwebtanzania-tracker-${{ github.run_id }}
           restore-keys: |
-            ethiojobs-tracker-
+            jobwebtanzania-tracker-
 
       - name: Run scraper
         env:
@@ -62,6 +62,6 @@ jobs:
         with:
           name: tanzania-output
           path: |
-            tanzania_jobs.xlsx
-            tanzania_flagged.csv
+            jobwebtanzania_jobs.xlsx
+            jobwebtanzania_flagged.csv
           if-no-files-found: ignore
