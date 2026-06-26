@@ -100,7 +100,7 @@ HEADERS = {
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 
-TANZANIA_LOCATIONS = [
+tanzania_LOCATIONS = [
     "Dar es Salaam", "Dodoma", "Mwanza", "Arusha", "Mbeya", "Morogoro",
     "Tanga", "Kahama", "Tabora", "Zanzibar", "Kigoma", "Sumbawanga",
     "Kasulu", "Musoma", "Shinyanga", "Songea", "Iringa", "Moshi",
@@ -109,9 +109,10 @@ TANZANIA_LOCATIONS = [
     "Pwani", "Kagera", "Manyara", "Pemba", "Unguja", "Ilala",
     "Kinondoni", "Temeke", "Ubungo", "Kigamboni",
 ]
-DEFAULT_LOCATION = os.environ.get("JOBWEB_DEFAULT_LOCATION", "Tanzania")
+DEFAULT_LOCATION = os.environ.get("JOBWEB_DEFAULT_LOCATION", "tanzania")
 
-_JOBTHEMES_PLACEHOLDER  = "http://www.jobthemes.com"
+# The demo/placeholder URL that JobRoller inserts — never a real apply link
+_JOBTHEMES_PLACEHOLDER = "http://www.jobthemes.com"
 _JOBTHEMES_PLACEHOLDER2 = "https://www.jobthemes.com"
 
 _NON_APPLY_HOST_SUBSTR = (
@@ -374,7 +375,7 @@ def pick_location(locations: list) -> str:
 
 def location_from_text(text: str) -> str:
     if text:
-        for city in TANZANIA_LOCATIONS:
+        for city in tanzania_LOCATIONS:
             if re.search(rf"\b{re.escape(city)}\b", text, re.I):
                 return city
     return DEFAULT_LOCATION
@@ -382,11 +383,10 @@ def location_from_text(text: str) -> str:
 def extract_salary(text: str) -> str:
     if not text:
         return ""
-    # Tanzania Shilling patterns
-    m = re.search(r"(?:TZS|TSH|Tsh|Tshs\.?|shilling)\s*([0-9]{1,3}(?:,\s?[0-9]{3})+(?:\.[0-9]+)?)", text, re.I)
+    m = re.search(r"(?:ETB|Br\.?|birr)\s*([0-9]{1,3}(?:,\s?[0-9]{3})+(?:\.[0-9]+)?)", text, re.I)
     if m:
         amt = re.sub(r"\s+", "", m.group(1))
-        return f"TZS {amt}"
+        return f"ETB {amt}"
     m = re.search(r"(?:salary|remuneration|pay)[^.\n]{0,80}", text, re.I)
     if m and re.search(r"\d", m.group(0)):
         return m.group(0).strip().rstrip(".")
@@ -394,18 +394,19 @@ def extract_salary(text: str) -> str:
 
 # =============================================================================
 #  CLEAN CATEGORY STRINGS
+#  Strips suffixes like "Jobs in tanzania", "Jobs in Addis Ababa", etc.
 # =============================================================================
 
 _CATEGORY_NOISE_RE = re.compile(
     r"\s*jobs?\s+in\s+tanzania\b.*$"
-    r"|\s*jobs?\s+in\s+dar\s+es\s+salaam\b.*$"
+    r"|\s*jobs?\s+in\s+addis\s+ababa\b.*$"
     r"|\s*jobs?\s+in\s+[a-z\s]+\b$"
     r"|\s*jobs?\s*$",
     re.I,
 )
 
 def clean_category(raw: str) -> str:
-    """Strip 'Jobs in Tanzania' and similar noise from a raw category string."""
+    """Strip 'Jobs in tanzania' and similar noise from a raw category string."""
     cleaned = _CATEGORY_NOISE_RE.sub("", raw.strip()).strip()
     return cleaned if cleaned else raw.strip()
 
@@ -446,8 +447,7 @@ QUALIFICATION_TIERS = [
     ("A-Levels / HSC",           ["a-level", "a level", "hsc", "higher school certificate",
                                    "gce advanced", "preparatory"]),
     ("O-Levels / School Certificate", ["o-level", "o level", "igcse", "gcse", "school certificate",
-                                        "grade 10", "grade 8", "8th grade complete", "grade 12",
-                                        "form four", "form six", "csee", "acsee"]),
+                                        "grade 10", "grade 8", "8th grade complete", "grade 12"]),
     ("No Formal Qualification Required", ["no qualification", "no degree", "no formal", "school leaver",
                                            "entry level", "no experience required", "training provided",
                                            "will train"]),
@@ -557,8 +557,8 @@ FIELD_KEYWORD_MAP = [
     ("Hospitality & Tourism",
      ["hotel manager", "front desk", "housekeeping", "chef", "sous chef", "food and beverage",
       "f&b manager", "restaurant manager", "bartender", "waiter", "concierge", "tour guide",
-      "travel agent", "events coordinator", "catering", "safari", "lodge manager"],
-     ["hospitality", "hotel", "resort", "tourism", "guest", "accommodation", "restaurant", "kitchen", "safari"]),
+      "travel agent", "events coordinator", "catering"],
+     ["hospitality", "hotel", "resort", "tourism", "guest", "accommodation", "restaurant", "kitchen"]),
     ("Logistics & Supply Chain",
      ["supply chain manager", "logistics coordinator", "warehouse manager", "fleet manager",
       "procurement manager", "purchasing manager", "import export", "freight", "shipping coordinator",
@@ -636,6 +636,7 @@ def infer_field(title: str, description: str, fallback_categories: str = "") -> 
     for field, _strong, weak in FIELD_KEYWORD_MAP:
         if _kw_hit(text, weak):
             return field
+    # fallback_categories are already cleaned before being passed here
     if fallback_categories:
         cats = [c.strip() for c in fallback_categories.split(",") if c.strip()]
         for c in cats:
@@ -1010,7 +1011,7 @@ def write_flagged(raw_job: dict, reason: str, apply_note: str):
     try:
         with open(FLAGGED_FILE, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([
-                "JobWebTanzania",
+                "JobWebtanzania",
                 raw_job.get("title", ""),
                 raw_job.get("company_name", ""),
                 raw_job.get("location", ""),
@@ -1225,7 +1226,25 @@ def collect_job_links(jobs_url: str, max_pages: int = MAX_PAGES) -> list:
     return ordered
 
 # =============================================================================
-#  STEP 2 — PARSE ONE JOBWEBTANZANIA DETAIL PAGE
+#  STEP 2 — PARSE ONE JOBWEBtanzania DETAIL PAGE
+#
+#  JobRoller structure (from Apps Script selectors):
+#    #mainContent
+#      div.section.single
+#        div.section_header
+#          h1                          → "Job Title at Company Name"
+#        div (2nd child — content div)
+#          ul                          → meta list (company, location, state, job type)
+#            li:nth-child(1)           → Company: <a>Company Name</a>
+#            li:nth-child(2)           → Location: <a>City</a>
+#            li:nth-child(3)           → State: <a>Region</a>
+#            li:nth-child(4)           → Job Type: <a>Full Time</a>
+#          font / p / div tags         → body paragraphs
+#          [last font/block]           → application info (email + deadline)
+#
+#  The apply email/URL is always towards the END of the content div, in a
+#  "Method of Application" / "How to Apply" section — just like the Apps Script
+#  reads font:nth-child(15) as the applicationInfo block.
 # =============================================================================
 
 def _is_real_apply_url(href: str) -> bool:
@@ -1249,35 +1268,54 @@ def _is_apply_heading_line(line: str) -> bool:
     return bool(_APPLY_HEAD_PHRASES.match(s))
 
 def _clean_location_str(raw: str) -> str:
+    """Strip trailing 'Jobs', 'Jobs in tanzania', city slug suffixes from location strings."""
     loc = raw.strip()
     loc = re.sub(r"\s+jobs?\s*$", "", loc, flags=re.I).strip()
     loc = re.sub(r"\s+jobs?\s+in\s+.+$", "", loc, flags=re.I).strip()
     return loc
 
 def _extract_jobroller_content(soup) -> tuple:
+    """
+    Extract (content_el, meta_ul) from a JobRoller page using the exact
+    DOM structure: #mainContent > div.section.single > div:nth-child(2)
+
+    Returns (content_div, meta_ul) where content_div is the main body container
+    and meta_ul is the <ul> holding Company / Location / Job Type meta items.
+    Falls back gracefully if the markup differs.
+    """
+    # Primary: exact JobRoller path
     main = soup.find(id="mainContent")
     if main:
         single = main.find("div", class_=lambda c: c and "single" in c.split())
         if single:
             children = [c for c in single.children
                         if getattr(c, "name", None) in ("div", "section")]
+            # The 2nd child div holds the meta + body
             content_div = children[1] if len(children) >= 2 else (children[0] if children else None)
             if content_div:
                 meta_ul = content_div.find("ul")
                 return content_div, meta_ul
 
+    # Fallback selectors in priority order
     for sel in ["div.single-job-content", "div.job-description", "div#job-detail",
                 "div.entry-content", "div.noo-job-content", "article", "main"]:
         el = soup.select_one(sel)
         if el and len(el.get_text(strip=True)) > 100:
             return el, el.find("ul")
 
+    # Last resort: body (will grab everything, but body-drop lines will filter nav junk)
     return soup.body or soup, None
 
 def _extract_body_blocks(content_div) -> list:
+    """
+    Return a list of (tag, text) for every meaningful text block inside
+    content_div, excluding the <ul> meta list at the top.
+    Blocks are <font>, <p>, <div>, <h2>...<h6>, <blockquote>, <li> children.
+    """
     blocks = []
     skip_tags = set()
 
+    # Mark the first <ul> (meta list) to skip
     first_ul = content_div.find("ul")
     if first_ul:
         skip_tags.add(id(first_ul))
@@ -1288,14 +1326,19 @@ def _extract_body_blocks(content_div) -> list:
         if child.name not in ("font", "p", "div", "h2", "h3", "h4", "h5", "h6",
                                "blockquote", "span", "b", "strong"):
             continue
+        # Skip if it's a descendant of the ul meta list
         if any(id(p) in skip_tags for p in child.parents):
             continue
+        # Skip empty nodes
         txt = child.get_text(" ", strip=True)
         if not txt or len(txt) < 5:
             continue
+        # Skip pure nav noise
         low = txt.lower()
         if low in _BODY_DROP_LINES:
             continue
+        # Skip if it's entirely contained in an ancestor we already added
+        # (avoid double-counting nested elements)
         parent_added = any(
             id(p) in {id(b[0]) for b in blocks}
             for p in child.parents
@@ -1309,17 +1352,31 @@ def _extract_body_blocks(content_div) -> list:
     return blocks
 
 def _split_blocks_at_apply(blocks: list) -> tuple:
+    """
+    Split blocks into (description_blocks, apply_blocks) at the first
+    'How to Apply' / 'Method of Application' heading line.
+    """
     for i, (tag, txt) in enumerate(blocks):
         if _is_apply_heading_line(txt):
             return blocks[:i], blocks[i:]
     return blocks, []
 
 def _extract_apply_from_blocks(apply_blocks, content_div) -> tuple:
+    """
+    From the apply section blocks, extract (apply_email, apply_url).
+    Searches:
+      1. Cloudflare-decoded email text already in the soup
+      2. mailto: anchors
+      3. Real external http URLs
+      4. Plain email addresses in text
+    """
     apply_email = ""
     apply_url   = ""
 
+    # Combine text of apply blocks for regex scanning
     apply_text = "\n".join(txt for _, txt in apply_blocks)
 
+    # 1. mailto: anchors anywhere in content_div (most reliable)
     for a in content_div.find_all("a", href=True):
         href = a["href"].strip()
         if href.lower().startswith("mailto:"):
@@ -1328,6 +1385,7 @@ def _extract_apply_from_blocks(apply_blocks, content_div) -> tuple:
                 apply_email = cand
                 break
 
+    # 2. Cloudflare-decoded email already embedded as plain text in apply section
     if not apply_email:
         m = EMAIL_PATTERN.search(apply_text)
         if m:
@@ -1335,6 +1393,7 @@ def _extract_apply_from_blocks(apply_blocks, content_div) -> tuple:
             if _is_real_apply_email(cand):
                 apply_email = cand
 
+    # 3. External URL in apply section (never jobthemes.com placeholder)
     for a in content_div.find_all("a", href=True):
         href = a["href"].strip()
         if _is_real_apply_url(href):
@@ -1350,10 +1409,11 @@ def _extract_apply_from_blocks(apply_blocks, content_div) -> tuple:
     return apply_email, apply_url
 
 def scrape_job_detail(url: str) -> dict:
-    """Parse a single JobWebTanzania /jobs/<slug>/ page into a raw_job dict."""
+    """Parse a single JobWebtanzania /jobs/<slug>/ page into a raw_job dict."""
     soup = get_soup(url)
 
     # ── Title ──────────────────────────────────────────────────────────────
+    # JobRoller H1: div.section_header > h1  OR  span#topss h1
     h1 = (soup.select_one("div.section_header h1")
           or soup.select_one("h1.job-title")
           or soup.select_one("h1.entry-title")
@@ -1401,14 +1461,17 @@ def scrape_job_detail(url: str) -> dict:
                 job_type = map_job_type(type_raw)
 
             elif li_lower.startswith("state") or "/job-state/" in a_href:
+                # State overrides location with more specific value
                 state_raw = a_text or re.sub(r"^state\s*:?\s*", "", li_text, flags=re.I).strip()
                 state_clean = _clean_location_str(state_raw)
                 if state_clean:
                     location = state_clean
 
     if not company_name:
-        company_name = company_from_h1 or "JobWebTanzania Employer"
+        company_name = company_from_h1 or "JobWebtanzania Employer"
 
+    # ── Also scan /job-location/ and /job-type/ anchor hrefs site-wide ────
+    # (fallback for themes that don't use ul meta list)
     if location == DEFAULT_LOCATION:
         for a in soup.find_all("a", href=True):
             if "/job-location/" in a["href"]:
@@ -1426,9 +1489,11 @@ def scrape_job_detail(url: str) -> dict:
     blocks = _extract_body_blocks(content_div)
     desc_blocks, apply_blocks = _split_blocks_at_apply(blocks)
 
+    # Build clean description text from desc_blocks
     seen_lines = set()
     desc_lines = []
     for tag, txt in desc_blocks:
+        # Convert block to multi-line text preserving bullets
         block_text = html_block_to_text(tag)
         for ln in block_text.split("\n"):
             ln_s = ln.strip()
@@ -1447,14 +1512,19 @@ def scrape_job_detail(url: str) -> dict:
     description = "\n".join(desc_lines).strip()
     description = re.sub(r"\n{3,}", "\n\n", description)
 
+    # Build apply text for display/debugging
     apply_text = "\n".join(txt for _, txt in apply_blocks)
 
+    # ── If description is still empty or tiny, use full content minus known junk ─
     if len(description.split()) < 20:
         full_text = html_block_to_text(content_div)
+        # Strip obvious nav noise at the top (everything before the first real sentence)
+        # Look for the first line that looks like actual job content
         lines = [l.strip() for l in full_text.split("\n") if l.strip()]
         content_start = 0
         for idx, ln in enumerate(lines):
             ln_low = ln.lower()
+            # Skip lines that are clearly nav/header noise
             if ln_low in {"home", "about us", "contact", "privacy policy",
                           "login/register", "submit a job", "submit job",
                           "register", "my dashboard", "linkedin page",
@@ -1464,10 +1534,12 @@ def scrape_job_detail(url: str) -> dict:
                 continue
             if re.match(r"^\d{1,2}\s+\w+\s+\d{4}$", ln):
                 continue
+            # Once we see something that looks real, start here
             if len(ln.split()) >= 4:
                 content_start = idx
                 break
         lines = lines[content_start:]
+        # Cut at apply heading or cut markers
         cut_at = len(lines)
         for idx, ln in enumerate(lines):
             if _is_apply_heading_line(ln):
@@ -1484,7 +1556,7 @@ def scrape_job_detail(url: str) -> dict:
     og = soup.find("meta", attrs={"property": "og:image"})
     if og and og.get("content"):
         candidate = og["content"].strip()
-        if "jobwebtanzania" not in candidate.lower():
+        if "jobwebethio" not in candidate.lower():
             logo = candidate
     if not logo:
         emp_img = soup.select_one("div.company-logo img") or soup.select_one("img.company-logo")
@@ -1502,6 +1574,7 @@ def scrape_job_detail(url: str) -> dict:
         if ds:
             date_posted = ds[0]
 
+    # Search entire page text for deadline
     page_text_full = soup.get_text("\n")
     for lab in DEADLINE_LABELS:
         m = re.search(rf"{re.escape(lab)}\s*[:\-]?\s*([^\n<]{{3,60}})", page_text_full, re.I)
@@ -1511,9 +1584,11 @@ def scrape_job_detail(url: str) -> dict:
                 deadline = d
                 break
 
+    # Also check apply_text for dates (closing dates often there)
     if not deadline and apply_text:
         ds = text_dates(apply_text) or dmy_dates(apply_text)
         if ds:
+            # Take the latest date found (most likely the deadline)
             deadline = sorted(ds)[-1]
 
     if not date_posted:
@@ -1524,6 +1599,7 @@ def scrape_job_detail(url: str) -> dict:
     # ── Apply: email + URL ─────────────────────────────────────────────────
     apply_email, apply_url = _extract_apply_from_blocks(apply_blocks, content_div)
 
+    # If no apply blocks found (no clear heading), search full content_div
     if not apply_email and not apply_url:
         apply_email, apply_url = _extract_apply_from_blocks([], content_div)
 
@@ -1535,6 +1611,7 @@ def scrape_job_detail(url: str) -> dict:
     salary = extract_salary(description)
 
     # ── Job field ─────────────────────────────────────────────────────────
+    # Clean category strings before passing to infer_field
     cleaned_categories = [clean_category(c) for c in job_categories]
     job_field_raw = ", ".join(dict.fromkeys(c for c in cleaned_categories if c))
     job_field = infer_field(title, description, job_field_raw)
@@ -1738,7 +1815,7 @@ def main():
 
     print()
     print(C_HEADER("=" * 80))
-    print(C_HEADER("  JOBWEBTANZANIA SCRAPER + MISTRAL PARAPHRASE + WORDPRESS POSTING"))
+    print(C_HEADER("  JOBWEBtanzania SCRAPER + MISTRAL PARAPHRASE + WORDPRESS POSTING"))
     print(C_HEADER("=" * 80))
     print(f"  Source          : {JOBS_URL}")
     print(f"  Public-apply    : {'✅ enforced (flag others)' if REQUIRE_PUBLIC_APPLY else '❌ off (post all)'}")
