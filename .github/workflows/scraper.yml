@@ -1,0 +1,67 @@
+name: Scraper
+on:
+  schedule:
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      inspect_url:
+        description: 'Set a job URL to run --inspect (canary) instead of a full scrape'
+        required: false
+        default: ''
+
+concurrency:
+  group: ethiojobs-scraper
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore tracker
+        uses: actions/cache@v4
+        with:
+          path: |
+            ethiojobs_ethiopia_processed.csv
+            ethiojobs_ethiopia_flagged.csv
+            ethiojobs_api_cache.json
+          key: ethiojobs-tracker-${{ github.run_id }}
+          restore-keys: |
+            ethiojobs-tracker-
+
+      - name: Run scraper
+        env:
+          WP_BASE_URL:      ${{ secrets.WP_BASE_URL }}
+          WP_USERNAME:      ${{ secrets.WP_USERNAME }}
+          WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD }}
+          MISTRAL_API_KEY:  ${{ secrets.MISTRAL_API_KEY }}
+          HEADLESS: '1'
+          APPLY_VIA_SOURCE_URL: '0'
+          INSPECT_URL: ${{ github.event.inputs.inspect_url }}
+        run: |
+          if [ -n "$INSPECT_URL" ]; then
+            python et.py --inspect "$INSPECT_URL"
+          else
+            python tz.py
+          fi
+
+      - name: Upload outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tanzania-output
+          path: |
+            tanzania_jobs.xlsx
+            tanzania_flagged.csv
+          if-no-files-found: ignore
