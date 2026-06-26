@@ -10,7 +10,7 @@ on:
         default: ''
 
 concurrency:
-  group: jobwebtanzania-scraper
+  group: ethiojobs-scraper
   cancel-in-progress: false
 
 jobs:
@@ -33,12 +33,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            jobwebtanzania_processed.csv
-            jobwebtanzania_flagged.csv
-            jobwebtanzania_api_cache.json
-          key: jobwebtanzania-tracker-${{ github.run_id }}
+            ethiojobs_ethiopia_processed.csv
+            ethiojobs_ethiopia_flagged.csv
+            ethiojobs_api_cache.json
+          key: ethiojobs-tracker-${{ github.run_id }}
           restore-keys: |
-            jobwebtanzania-tracker-
+            ethiojobs-tracker-
 
       - name: Run scraper
         env:
@@ -53,15 +53,15 @@ jobs:
           if [ -n "$INSPECT_URL" ]; then
             python et.py --inspect "$INSPECT_URL"
           else
-            python tz.py
+            python et.py
           fi
 
       - name: Upload outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tanzania-output
+          name: ethiojobs-output
           path: |
-            jobwebtanzania_jobs.xlsx
-            jobwebtanzania_flagged.csv
+            ethiojobs_ethiopia_jobs.xlsx
+            ethiojobs_ethiopia_flagged.csv
           if-no-files-found: ignore
