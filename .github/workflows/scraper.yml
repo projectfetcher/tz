@@ -8,59 +8,49 @@ on:
         description: 'Set a job URL to run --inspect (canary) instead of a full scrape'
         required: false
         default: ''
-
 concurrency:
-  group: ethiojobs-scraper
+  group: jobwebtanzania-scraper
   cancel-in-progress: false
-
 jobs:
   scrape:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
       - name: Restore tracker
         uses: actions/cache@v4
         with:
           path: |
-            ethiojobs_ethiopia_processed.csv
-            ethiojobs_ethiopia_flagged.csv
-            ethiojobs_api_cache.json
-          key: ethiojobs-tracker-${{ github.run_id }}
+            jobwebtanzania_processed.csv
+            jobwebtanzania_flagged.csv
+          key: jobwebtanzania-tracker-${{ github.run_id }}
           restore-keys: |
-            ethiojobs-tracker-
-
+            jobwebtanzania-tracker-
       - name: Run scraper
         env:
           WP_BASE_URL:      ${{ secrets.WP_BASE_URL }}
           WP_USERNAME:      ${{ secrets.WP_USERNAME }}
           WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD }}
           MISTRAL_API_KEY:  ${{ secrets.MISTRAL_API_KEY }}
-          HEADLESS: '1'
-          APPLY_VIA_SOURCE_URL: '0'
-          INSPECT_URL: ${{ github.event.inputs.inspect_url }}
         run: |
-          if [ -n "$INSPECT_URL" ]; then
-            python et.py --inspect "$INSPECT_URL"
+          if [ -n "${{ github.event.inputs.inspect_url }}" ]; then
+            python tz.py --inspect "${{ github.event.inputs.inspect_url }}"
           else
             python tz.py
           fi
-
       - name: Upload outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ethiojobs-output
+          name: jobwebtanzania-output
           path: |
-            ethiojobs_ethiopia_jobs.xlsx
-            ethiojobs_ethiopia_flagged.csv
+            jobwebtanzania_jobs.xlsx
+            jobwebtanzania_processed.csv
+            jobwebtanzania_flagged.csv
           if-no-files-found: ignore
