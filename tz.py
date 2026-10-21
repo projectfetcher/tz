@@ -53,11 +53,14 @@ BAD_URL_HOSTS = OWN_HOSTS + (
     "wa.me", "instagram.com", "t.me", "youtube.com", "google.com", "pinterest.com",
 )
 
+# Column names match the variables your WordPress save_job() reads.
 FIELDS = [
-    "title", "company", "location", "job_type", "categories", "date_posted",
-    "deadline", "salary", "experience", "apply_email", "apply_url",
-    "description", "company_about", "company_industry", "logo", "job_url",
-    "scraped_at",
+    "Job Title", "Job Description", "Company Details", "Job Type",
+    "Job Qualifications", "Job Experience", "Job Location", "Job Field",
+    "Date Posted", "Deadline", "Estimated Deadline", "Salary Range",
+    "Application", "Company Name", "Company Logo", "Company Industry",
+    "Company Founded", "Company Type", "Company Website", "Company Address",
+    "Company Url", "Job URL", "Scraped At",
 ]
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
@@ -207,6 +210,111 @@ def block_text(el):
 APPLY_HEAD_RE = re.compile(
     r"^(how to apply|method of application|application procedure|to apply|apply now|"
     r"how can you apply|application method)\b", re.I)
+
+
+# ----------------------------------------------------------------------------
+# FIELD EXTRACTORS (job type, qualifications, experience, salary, field ...)
+# ----------------------------------------------------------------------------
+JOB_TYPE_MAP = [
+    ("intern", "internship"), ("volunteer", "volunteer"), ("freelanc", "freelance"),
+    ("consult", "contract"), ("contract", "contract"), ("temporar", "temporary"),
+    ("part", "part-time"), ("full", "full-time"),
+]
+
+
+def map_job_type(raw):
+    r = (raw or "").lower()
+    for key, val in JOB_TYPE_MAP:
+        if key in r:
+            return val
+    return "full-time"
+
+
+def _years(lo, hi=None, plus=False):
+    if hi:
+        return f"{lo}-{hi} years"
+    return f"{lo}+ years" if plus else f"{lo} year" + ("" if lo == 1 else "s")
+
+
+EXP_RANGE_RE = re.compile(r"(\d{1,2})\s*(?:-|–|—|to)\s*(\d{1,2})\s*\+?\s*(?:years?|yrs?)\b", re.I)
+EXP_SINGLE_RE = re.compile(
+    r"(?:(minimum|min\.?|at\s*least|over|more\s+than)\s+(?:of\s+)?)?"
+    r"(\d{1,2})\s*(\+)?\s*(?:years?|yrs?)\b", re.I)
+EXP_ENTRY_RE = re.compile(
+    r"entry[\s-]*level|fresh(?:er)?\s+graduate|recent\s+graduate|no\s+(?:prior\s+)?experience"
+    r"\s+(?:is\s+)?(?:required|needed|necessary)|graduate\s+trainee", re.I)
+
+
+def extract_experience(text):
+    """e.g. '3+ years', '2-5 years', 'Entry level' ('' when the text says nothing)."""
+    text = text or ""
+    for m in EXP_RANGE_RE.finditer(text):
+        ctx = text[max(0, m.start() - 80): m.end() + 100].lower()
+        if "experience" in ctx and int(m.group(1)) < int(m.group(2)):
+            return _years(m.group(1), m.group(2))
+    for m in EXP_SINGLE_RE.finditer(text):
+        ctx = text[max(0, m.start() - 80): m.end() + 100].lower()
+        if "experience" in ctx and "years old" not in ctx and int(m.group(2)) > 0:
+            return _years(int(m.group(2)), plus=bool(m.group(1) or m.group(3)))
+    if EXP_ENTRY_RE.search(text):
+        return "Entry level"
+    return ""
+
+
+EDU_RE = re.compile(
+    r"\b(ph\.?d|doctorate|master'?s?|msc|m\.sc|mba|bachelor'?s?|b\.?sc|bsc|b\.?com|"
+    r"degree|advanced\s+diploma|ordinary\s+diploma|diploma|certificate|cpa\b|cpa\(t\)|acca|"
+    r"cfa|nacte|csee|acsee|form\s+(?:four|six)|o-level|a-level)", re.I)
+QUAL_HEAD_RE = re.compile(
+    r"^(qualifications?|education|academic|requirements?|minimum requirements?|"
+    r"key requirements?|skills\s*(?:and|&)\s*qualifications?|education\s*(?:and|&)\s*experience|"
+    r"desired candidate|person specification|what we are looking for)\b", re.I)
+
+
+def _is_heading(line):
+    s = line.strip()
+    return (not s.startswith("-")) and len(s) <= 70 and (s.endswith(":") or s.isupper()
+                                                          or len(s.split()) <= 4)
+
+
+def extract_qualification(description):
+    lines = [l.strip() for l in (description or "").split("\n") if l.strip()]
+    picked = []
+    for i, ln in enumerate(lines):
+        head = ln.strip(":*#- ").strip()
+        if _is_heading(ln) and QUAL_HEAD_RE.match(head):
+            for nxt in lines[i + 1: i + 9]:
+                if _is_heading(nxt) and not EDU_RE.search(nxt):
+                    break
+                if EDU_RE.search(nxt):
+                    picked.append(nxt.lstrip("- ").strip())
+            if picked:
+                break
+    if not picked:
+        picked = [l.lstrip("- ").strip() for l in lines if EDU_RE.search(l) and len(l) < 300]
+    return "; ".join(p[:200] for p in picked[:3])
+
+
+SALARY_RE = re.compile(
+    r"(?:TZS|TSH|TShs?|USD|US\$|\$)\s?[\d][\d,\.]*\s?(?:k|m|million)?"
+    r"(?:\s?(?:-|–|to)\s?(?:TZS|TSH|TShs?|USD|US\$|\$)?\s?[\d][\d,\.]*\s?(?:k|m|million)?)?"
+    r"(?:\s?(?:per|/|a)\s?(?:month|year|annum|week|day|hour))?", re.I)
+
+
+def extract_salary(description):
+    m = SALARY_RE.search(description or "")
+    return clean(m.group(0)) if m else ""
+
+
+def infer_job_field(categories, url):
+    if categories:
+        return ", ".join(categories[:2])
+    parts = [s for s in urlsplit(url).path.split("/") if s]
+    return parts[1].replace("-", " ").title() if len(parts) >= 2 else ""
+
+
+def abs_url(u):
+    return urljoin(BASE + "/", u) if u else ""
 
 
 # ----------------------------------------------------------------------------
@@ -365,30 +473,89 @@ def scrape_job(url):
             body = lines
         description = "\n".join(body).strip()
 
-    date_posted = to_iso_date(insights.get("date posted", "")) or datetime.now().strftime("%Y-%m-%d")
+    # dates: Deadline = the real closing date; if the site has none, leave it
+    # empty and give an Estimated Deadline (posted + 30 days) instead.
+    today = datetime.now().strftime("%Y-%m-%d")
+    date_posted = to_iso_date(insights.get("date posted", "")) or today
     deadline = to_iso_date(insights.get("closing date", ""))
+    estimated_deadline = ""
     if not deadline:
-        deadline = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+        try:
+            base_day = datetime.strptime(date_posted, "%Y-%m-%d")
+        except ValueError:
+            base_day = datetime.now()
+        estimated_deadline = (base_day + timedelta(days=30)).strftime("%Y-%m-%d")
 
-    salary = next((v for k, v in insights.items() if "salary" in k and v), "")
-    experience = insights.get("experience", "")
+    # experience: trust the job text first (the insights box is often generic)
+    experience = extract_experience(description)
+    if not experience:
+        m = re.search(r"(\d{1,2})", insights.get("experience", ""))
+        experience = _years(int(m.group(1)), plus=True) if m and int(m.group(1)) > 0 else ""
 
-    about = industry = ""
+    salary = next((v for k, v in insights.items()
+                   if "salary" in k and v and v.strip().lower() not in ("n/a", "-", "none")), "")
+    salary = salary or extract_salary(description)
+
+    # company sidebar
+    about = industry = website = company_type = company_address = founded = ""
     side = soup.select_one(".jobs-company-sidebar")
     if side:
         content = side.select_one(".content-truncated .content")
         about = block_text(content) if content else ""
         cate = side.select_one(".list-cate a")
         industry = re.sub(r"\s+Companies$", "", txt(cate), flags=re.I).strip() if cate else ""
+        for info in side.select(".info"):
+            k = txt(info.select_one(".title-info")).lower()
+            v = txt(info.select_one(".details-info"))
+            if not k or not v:
+                continue
+            if "location" in k or "address" in k:
+                company_address = company_address or v
+            elif "type" in k:
+                company_type = company_type or v
+        for a in side.find_all("a", href=True):
+            href = a["href"].strip()
+            cls = " ".join(a.get("class", [])).lower()
+            if ok_url(href) and (re.search(r"web|site|visit", txt(a), re.I) or "website" in cls):
+                website = href
+                break
+        fm = re.search(r"(?:founded|established|since)\s+(?:in\s+)?((?:19|20)\d{2})", about, re.I)
+        founded = fm.group(1) if fm else ""
 
+    job_url = norm_url(url)
     return {
         "title": title, "company": company, "location": location,
-        "job_type": raw_type, "categories": ", ".join(categories),
-        "date_posted": date_posted, "deadline": deadline, "salary": salary,
-        "experience": experience, "apply_email": apply_email, "apply_url": apply_url,
+        "job_type": raw_type, "job_type_mapped": map_job_type(raw_type),
+        "categories": categories, "job_field": infer_job_field(categories, job_url),
+        "date_posted": date_posted, "deadline": deadline,
+        "estimated_deadline": estimated_deadline, "salary": salary,
+        "qualification": extract_qualification(description), "experience": experience,
+        "apply_email": apply_email, "apply_url": apply_url,
         "description": description, "company_about": about,
-        "company_industry": industry, "logo": logo, "job_url": norm_url(url),
+        "company_industry": industry, "company_founded": founded,
+        "company_type": company_type, "company_website": website,
+        "company_address": company_address or location,
+        "logo": abs_url(logo), "job_url": job_url,
         "scraped_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def to_row(j):
+    """Internal job dict -> one row with the column names save_job() reads."""
+    return {
+        "Job Title": j["title"], "Job Description": j["description"],
+        "Company Details": j["company_about"], "Job Type": j["job_type_mapped"],
+        "Job Qualifications": j["qualification"], "Job Experience": j["experience"],
+        "Job Location": j["location"], "Job Field": j["job_field"],
+        "Date Posted": j["date_posted"], "Deadline": j["deadline"],
+        "Estimated Deadline": j["estimated_deadline"], "Salary Range": j["salary"],
+        "Application": j["apply_email"] or j["apply_url"],
+        "Company Name": j["company"], "Company Logo": j["logo"],
+        "Company Industry": j["company_industry"], "Company Founded": j["company_founded"],
+        "Company Type": j["company_type"], "Company Website": j["company_website"],
+        "Company Address": j["company_address"],
+        "Company Url": "",            # never link back to zoomtanzania.net
+        "Job URL": j["job_url"], "Scraped At": j["scraped_at"],
     }
 
 
@@ -407,13 +574,19 @@ def mark_seen(url):
         f.write(url + "\n")
 
 
-def append_csv(job):
+def append_csv(row):
+    # an older run may have written different columns: set that file aside
+    if os.path.exists(CSV_FILE) and os.path.getsize(CSV_FILE) > 0:
+        with open(CSV_FILE, encoding="utf-8-sig") as f:
+            first = f.readline().strip()
+        if first != ",".join(FIELDS):
+            os.replace(CSV_FILE, CSV_FILE.replace(".csv", "_old_columns.csv"))
     new_file = not os.path.exists(CSV_FILE) or os.path.getsize(CSV_FILE) == 0
     with open(CSV_FILE, "a", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
         if new_file:
             w.writeheader()
-        w.writerow(job)
+        w.writerow(row)
 
 
 # ----------------------------------------------------------------------------
@@ -457,10 +630,11 @@ def main():
             seen_urls.add(link)
             continue
 
-        append_csv(job)
+        row = to_row(job)
+        append_csv(row)
         mark_seen(link)
         seen_urls.add(link)
-        new_jobs.append(job)
+        new_jobs.append(row)
         apply = job["apply_email"] or job["apply_url"] or "no public apply"
         print(f"  [{len(new_jobs)}] {job['title']} | {job['company']} | "
               f"{job['location']} | apply: {apply}")
