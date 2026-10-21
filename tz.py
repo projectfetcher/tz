@@ -1,27 +1,4 @@
-"""
-ZoomTanzania.net scraper  ->  WordPress (MimusJobs)
-Third source for tz_jobs_scraper.py (same tracker, Excel export, paraphrasing,
-WordPress posting, cross-source title+company de-duplication).
 
-Put this file NEXT TO tz_jobs_scraper.py and run:
-
-    python zoomtanzania_scraper.py                         # zoom only
-    python zoomtanzania_scraper.py --sources zoom
-    python zoomtanzania_scraper.py --sources jobweb,zoom,linkedin   # any order
-    SOURCES=zoom python zoomtanzania_scraper.py            # via env (GitHub Actions)
-
-Environment variables (all optional, plus the ones tz_jobs_scraper already uses):
-    ZOOM_JOBS_URL        archive to crawl (default https://www.zoomtanzania.net/jobs/)
-                         e.g. .../jobs-location/dar-es-salaam/ or .../jobs-categories/banking/
-    ZOOM_MAX_PAGES       max archive pages per run (default 10)
-    ZOOM_DELAY           seconds between requests (default 1.0)
-    ZOOM_STOP_ON_KNOWN   1 (default) = stop paging once a whole page is already in the tracker
-                         (archive is newest-first, so daily runs stay fast)
-    ZOOM_SKIP_TYPES      comma list of job types to skip (default: scholarship,grants)
-    ZOOM_DEFAULT_LOCATION  fallback location (default Tanzania)
-    REQUIRE_PUBLIC_APPLY same switch as the main script: jobs with no public apply
-                         email / external URL go to flagged_jobs_tz.csv instead of WordPress
-"""
 import os
 import re
 import sys
