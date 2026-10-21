@@ -9,11 +9,14 @@ Output (in the current folder):
     zoom_jobs.json       jobs scraped in THIS run
     zoom_seen.txt        URLs already scraped (used to skip duplicates)
 
+How it finds jobs: the site's /jobs/ page only shows 12 jobs and loads more with
+JavaScript (/jobs/page/2/ just repeats page 1), so the scraper reads the site's
+job sitemaps (jobs-sitemap.xml ... jobs-sitemap9.xml), which list every job,
+newest first, and walks back through them page after page.
+
 Optional environment variables:
-    ZOOM_JOBS_URL        archive to crawl (default https://www.zoomtanzania.net/jobs/)
-    ZOOM_MAX_PAGES       max archive pages per run (default 10)
+    ZOOM_MAX_JOBS        max NEW jobs to scrape per run (default 200, 0 = no limit)
     ZOOM_DELAY           seconds between requests (default 1.0)
-    ZOOM_STOP_ON_KNOWN   1 (default) = stop paging once a whole page is already seen
     ZOOM_SKIP_TYPES      comma list of job types to skip (default: scholarship,grants)
     JOB_LIMIT            stop after this many new jobs (default 0 = no limit)
 """
@@ -32,10 +35,9 @@ from bs4 import BeautifulSoup, Comment
 # CONFIG
 # ----------------------------------------------------------------------------
 BASE = "https://www.zoomtanzania.net"
-JOBS_URL = os.environ.get("ZOOM_JOBS_URL", f"{BASE}/jobs/")
-MAX_PAGES = int(os.environ.get("ZOOM_MAX_PAGES", "10"))
+JOBS_URL = f"{BASE}/jobs/"
+MAX_JOBS = int(os.environ.get("ZOOM_MAX_JOBS", "200") or 0)
 DELAY = float(os.environ.get("ZOOM_DELAY", "1.0"))
-STOP_ON_KNOWN = os.environ.get("ZOOM_STOP_ON_KNOWN", "1") != "0"
 SKIP_TYPES = {t.strip().lower() for t in
               os.environ.get("ZOOM_SKIP_TYPES", "scholarship,grants").split(",") if t.strip()}
 JOB_LIMIT = int(os.environ.get("JOB_LIMIT", "0") or 0)
@@ -126,13 +128,6 @@ def is_job_path(path):
     return len(parts) == 3 and parts[0] == "jobs" and parts[1] not in ("at", "page")
 
 
-def page_url(base, page):
-    if page <= 1:
-        return base
-    base = base if base.endswith("/") else base + "/"
-    return f"{base}page/{page}/"
-
-
 def to_iso_date(value):
     if not value:
         return ""
@@ -217,43 +212,99 @@ APPLY_HEAD_RE = re.compile(
 # ----------------------------------------------------------------------------
 # STEP 1: collect job links
 # ----------------------------------------------------------------------------
-def collect_links(seen_urls):
-    print(f"\nCollecting job links from {JOBS_URL}")
-    seen, ordered, empty_streak = set(), [], 0
-    for page in range(1, MAX_PAGES + 1):
-        url = page_url(JOBS_URL, page)
+SITEMAP_LOC_RE = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>", re.I)
+
+
+def get_raw(url, retries=3):
+    """Fetch a URL and return its text, or None on 404 / repeated failure."""
+    for attempt in range(retries):
         try:
-            soup = get_soup(url)
-        except requests.HTTPError as e:
-            code = getattr(e.response, "status_code", "?")
-            print(f"  Page {page}: HTTP {code}, stopping.")
-            break
-        except Exception as e:
-            print(f"  Page {page}: error ({e}), stopping.")
-            break
+            r = SESSION.get(url, timeout=60)
+            if r.status_code == 404:
+                return None
+            if r.status_code == 429:
+                time.sleep(30 + attempt * 30)
+                continue
+            r.raise_for_status()
+            return r.text
+        except Exception:
+            time.sleep(2 + attempt * 2)
+    return None
 
-        anchors = soup.select(".civi-jobs-item a[href]") or soup.find_all("a", href=True)
-        page_links = []
-        for a in anchors:
-            n = norm_url(a["href"])
-            if n and is_job_path(urlsplit(n).path) and n not in seen:
-                seen.add(n)
-                page_links.append(n)
-        ordered.extend(page_links)
-        known = sum(1 for u in page_links if u in seen_urls)
-        print(f"  Page {page}: {len(page_links)} link(s), {known} already scraped "
-              f"(total {len(ordered)})")
 
-        if not page_links:
-            empty_streak += 1
-            if empty_streak >= 2:
+def jobs_sitemap_urls():
+    """URLs of the job sitemaps, oldest first (the last one holds the newest jobs)."""
+    urls = []
+    index = get_raw(f"{BASE}/sitemap.xml") or get_raw(f"{BASE}/sitemap_index.xml")
+    if index:
+        for loc in SITEMAP_LOC_RE.findall(index):
+            if re.search(r"/jobs-sitemap\d*\.xml$", loc):
+                urls.append(loc)
+    if not urls:                       # index unreadable: probe the usual names
+        for n in range(1, 40):
+            name = "jobs-sitemap.xml" if n == 1 else f"jobs-sitemap{n}.xml"
+            if get_raw(f"{BASE}/{name}") is None:
                 break
-        else:
-            empty_streak = 0
-            if STOP_ON_KNOWN and known == len(page_links):
-                print("  Whole page already scraped, stopping.")
+            urls.append(f"{BASE}/{name}")
+
+    def num(u):
+        m = re.search(r"jobs-sitemap(\d*)\.xml$", u)
+        return int(m.group(1) or 1)
+    return sorted(set(urls), key=num)
+
+
+def collect_links_from_archive():
+    """Fallback: only the 12 newest jobs shown on /jobs/ (no pagination possible)."""
+    soup = get_soup(JOBS_URL)
+    anchors = soup.select(".civi-jobs-item a[href]") or soup.find_all("a", href=True)
+    out, seen = [], set()
+    for a in anchors:
+        n = norm_url(a["href"])
+        if n and is_job_path(urlsplit(n).path) and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def collect_links(seen_urls):
+    """Newest-first list of job URLs not scraped yet (at most MAX_JOBS)."""
+    print(f"\nCollecting job links from the job sitemaps of {BASE}")
+    sitemaps = jobs_sitemap_urls()
+    if not sitemaps:
+        print("  No sitemaps found, falling back to the first /jobs/ page (12 jobs only).")
+        links = [u for u in collect_links_from_archive() if u not in seen_urls]
+        return links[:MAX_JOBS] if MAX_JOBS else links
+
+    print(f"  Found {len(sitemaps)} job sitemap(s).")
+    ordered, seen, total_in_maps = [], set(), 0
+    # Newest jobs are in the LAST sitemap, and each sitemap is oldest-first,
+    # so go from the last sitemap backwards and reverse each one.
+    for sm in reversed(sitemaps):
+        body = get_raw(sm)
+        if body is None:
+            print(f"  Could not read {sm}, skipping.")
+            continue
+        locs = [norm_url(u) for u in SITEMAP_LOC_RE.findall(body)]
+        locs = [u for u in locs if u and is_job_path(urlsplit(u).path)]
+        total_in_maps += len(locs)
+        fresh = 0
+        for u in reversed(locs):
+            if u in seen:
+                continue
+            seen.add(u)
+            if u in seen_urls:
+                continue
+            ordered.append(u)
+            fresh += 1
+            if MAX_JOBS and len(ordered) >= MAX_JOBS:
                 break
+        print(f"  {sm.rsplit('/', 1)[-1]}: {len(locs)} job(s), {fresh} new "
+              f"(queue {len(ordered)})")
+        if MAX_JOBS and len(ordered) >= MAX_JOBS:
+            print(f"  Reached ZOOM_MAX_JOBS ({MAX_JOBS}).")
+            break
         time.sleep(DELAY)
+    print(f"  {total_in_maps} job URL(s) read from sitemaps so far.")
     return ordered
 
 
