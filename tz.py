@@ -55,6 +55,16 @@ Optional environment variables:
     LI_COUNTRY           search location (default Tanzania)
     LI_MAX_PAGES         safety cap on LinkedIn result pages per keyword (default 40)
     LI_DELAY             seconds between LinkedIn requests (default 2.0)
+
+WordPress posting (every new job is posted straight to WordPress as it is scraped):
+    WP_BASE_URL          REST base of your site (required to post)
+    WP_USERNAME          WordPress user (required to post)
+    WP_APP_PASSWORD      application password of that user (required to post)
+    INTERNAL_BOT_KEY     optional, sent as the X-Internal-Auth header
+    WP_VERIFY_SSL        1 = verify the site's SSL certificate (default 0, as in your old script)
+    If any of the three required settings is missing, posting is switched off and the
+    script only writes the CSV / JSON / Excel files.
+    OUTPUT_FILE          Excel file for this run's jobs (default scraped_jobs.xlsx)
 """
 import base64
 import csv
@@ -71,6 +81,16 @@ from urllib.parse import (parse_qsl, quote, quote_plus, unquote, urlencode, urlj
 
 import requests
 from bs4 import BeautifulSoup, Comment
+
+try:
+    import openpyxl                      # only needed for the Excel file
+except ImportError:
+    openpyxl = None
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
 
 # ----------------------------------------------------------------------------
 # CONFIG
@@ -112,6 +132,39 @@ LI_DELAY = float(os.environ.get("LI_DELAY", "2.0"))
 
 JOB_LIMIT = int(os.environ.get("JOB_LIMIT", "0") or 0)
 MAX_CONSECUTIVE_ERRORS = 8          # a source stops after this many failed jobs in a row
+
+# ---- WordPress ----
+WP_URL      = os.environ.get("WP_BASE_URL", "")
+WP_USER     = os.environ.get("WP_USERNAME", "")
+WP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
+INTERNAL_BOT_KEY = os.environ.get("INTERNAL_BOT_KEY", "")
+WP_BASE      = WP_URL.strip().rstrip("/")
+WP_JOBS_URL  = f"{WP_BASE}/job-listings"
+WP_MEDIA_URL = f"{WP_BASE}/media"
+WP_VERIFY    = os.environ.get("WP_VERIFY_SSL", "0") == "1"
+WP_ENABLED   = bool(WP_BASE and WP_USER and WP_PASSWORD)
+WP_MAX_FAIL_STREAK = 5               # stop posting after this many failed posts in a row
+
+JOB_TYPE_MAPPING = {
+    "full-time": "full-time", "full time": "full-time",
+    "part-time": "part-time", "part time": "part-time",
+    "contract":  "contract",  "temporary": "temporary",
+    "internship": "internship", "freelance": "freelance",
+    "volunteer": "volunteer", "permanent": "full-time",
+    "full-timer": "full-time", "full timer": "full-time",
+}
+
+# ---- Excel ----
+OUTPUT_FILE = os.environ.get("OUTPUT_FILE", "scraped_jobs.xlsx")
+SHEET_NAME = "Sheet1"
+EXCEL_HEADERS = [
+    "Job Title", "Job Type", "Job Qualifications", "Job Experience",
+    "Job Location", "Job Field", "Date Posted", "Deadline",
+    "Job Description", "Application", "Company URL", "Company Name",
+    "Company Logo", "Company Industry", "Company Founded", "Company Type",
+    "Company Website", "Company Address", "Company Details", "Job URL",
+    "Estimated Deadline", "Salary Range",
+]
 
 CSV_FILE = "scraped_jobs.csv"
 JSON_FILE = "scraped_jobs.json"
@@ -244,9 +297,27 @@ def ok_email(em):
         and not em.startswith(("noreply@", "no-reply@", "example@"))
 
 
+BAD_URL_PATHS = ("/accessibility", "/get-prepared", "/privacy", "/terms", "/cookie")
+
+
+def url_as_email(u):
+    """'http://name@domain.org/' is really an email address written as a link."""
+    try:
+        net = urlsplit(u).netloc
+    except ValueError:
+        return ""
+    return net if "@" in net and EMAIL_RE.fullmatch(net) else ""
+
+
 def ok_url(u):
     u = u.lower()
-    return u.startswith("http") and not any(h in u for h in BAD_URL_HOSTS)
+    if not u.startswith("http") or any(h in u for h in BAD_URL_HOSTS):
+        return False
+    try:
+        p = urlsplit(u)
+    except ValueError:
+        return False
+    return "@" not in p.netloc and not any(b in p.path for b in BAD_URL_PATHS)
 
 
 def find_apply(scopes):
@@ -261,6 +332,9 @@ def find_apply(scopes):
                 c = h[7:].split("?")[0].strip()
                 if ok_email(c) and not email:
                     email = c
+            elif url_as_email(h):
+                if not email and ok_email(url_as_email(h)):
+                    email = url_as_email(h)
             elif not url and ok_url(h):
                 url = h
         text = scope.get_text(" ")
@@ -328,14 +402,16 @@ def estimated_deadline_for(date_posted):
 # FIELD EXTRACTORS (job type, qualifications, experience, salary)
 # ----------------------------------------------------------------------------
 JOB_TYPE_MAP = [
-    ("intern", "internship"), ("volunteer", "volunteer"), ("freelanc", "freelance"),
+    ("perman", "full-time"), ("intern", "internship"), ("volunteer", "volunteer"), ("freelanc", "freelance"),
     ("consult", "contract"), ("contract", "contract"), ("temporar", "temporary"),
     ("part", "part-time"), ("full", "full-time"),
 ]
 
 
 def map_job_type(raw):
-    r = (raw or "").lower()
+    r = (raw or "").lower().strip()
+    if r in JOB_TYPE_MAPPING:
+        return JOB_TYPE_MAPPING[r]
     for key, val in JOB_TYPE_MAP:
         if key in r:
             return val
@@ -2431,6 +2507,220 @@ def append_csv(row):
 
 
 # ----------------------------------------------------------------------------
+# WORDPRESS POSTING + EXCEL
+# ----------------------------------------------------------------------------
+WP_STATE = {"fail_streak": 0, "down": False}
+WP_TERM_CACHE = {}
+EXCEL_JOBS = []                       # jobs of THIS run, written to the Excel file
+_ILLEGAL_XLSX_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+
+def wp_missing_settings():
+    return [n for n, v in (("WP_BASE_URL", WP_URL), ("WP_USERNAME", WP_USER),
+                           ("WP_APP_PASSWORD", WP_PASSWORD)) if not v]
+
+
+def wp_headers(content_type="application/json"):
+    token = base64.b64encode(f"{WP_USER}:{WP_PASSWORD}".encode()).decode()
+    h = {"Authorization": f"Basic {token}", "Content-Type": content_type,
+         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")}
+    if INTERNAL_BOT_KEY:
+        h["X-Internal-Auth"] = INTERNAL_BOT_KEY
+    return h
+
+
+def wp_error_text(r):
+    body = clean(re.sub(r"<[^>]+>", " ", r.text or ""))[:200]
+    hint = ""
+    if r.status_code == 404:
+        hint = " (check that WP_BASE_URL is your REST base and that the 'job-listings' route exists)"
+    elif r.status_code in (401, 403):
+        hint = " (check WP_USERNAME / WP_APP_PASSWORD / INTERNAL_BOT_KEY and any firewall rule)"
+    return f"HTTP {r.status_code}: {body}{hint}"
+
+
+def wp_term_id(taxonomy_url, name):
+    """Id of a WordPress term (region / job type), created when it does not exist."""
+    if not name or not name.strip():
+        return None
+    key = (taxonomy_url, name.lower().strip())
+    if key in WP_TERM_CACHE:
+        return WP_TERM_CACHE[key]
+    slug = re.sub(r"[^a-z0-9-]", "-", name.lower().strip())
+    term_id = None
+    try:
+        r = requests.get(taxonomy_url, params={"slug": slug}, headers=wp_headers(),
+                         timeout=15, verify=WP_VERIFY)
+        terms = r.json()
+        if isinstance(terms, list) and terms:
+            term_id = terms[0].get("id")
+    except Exception:
+        pass
+    if not term_id:
+        try:
+            r = requests.post(taxonomy_url, json={"name": name, "slug": slug},
+                              headers=wp_headers(), timeout=15, verify=WP_VERIFY)
+            data = r.json()
+            if isinstance(data, dict):
+                extra = data.get("data") if isinstance(data.get("data"), dict) else {}
+                term_id = data.get("id") or extra.get("term_id")      # term_exists -> its id
+        except Exception as e:
+            print(f"  (could not create term '{name}': {e})")
+    WP_TERM_CACHE[key] = term_id
+    return term_id
+
+
+def wp_upload_logo(logo_url, company):
+    """Upload the company logo to the media library; id or None."""
+    if not logo_url.startswith("http"):
+        return None
+    try:
+        img = requests.get(logo_url, headers={"User-Agent": SESSION.headers["User-Agent"]},
+                           timeout=15)
+        ct = (img.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if img.status_code != 200 or not ct.startswith("image/") or "svg" in ct:
+            return None
+        ext = "png" if "png" in ct else "gif" if "gif" in ct else "webp" if "webp" in ct else "jpg"
+        name = re.sub(r"[^a-z0-9]+", "-", (company or "company").lower()).strip("-") or "company"
+        h = wp_headers(ct)
+        h["Content-Disposition"] = f"attachment; filename={name}-logo.{ext}"
+        up = requests.post(WP_MEDIA_URL, headers=h, data=img.content, timeout=30,
+                           verify=WP_VERIFY)
+        if up.status_code in (200, 201):
+            return up.json().get("id")
+    except Exception as e:
+        print(f"  (logo upload failed: {e})")
+    return None
+
+
+def post_job_to_wordpress(job):
+    """Post one job. Returns (wp_id, link, error_text). Never raises."""
+    title = (job["jobTitle"] or "").strip()
+    description = (job["jobDescription"] or "").strip()
+    if not title or not description:
+        return None, None, "empty title or description"
+    company = (job["companyName"] or "").strip()
+
+    # the slug includes the company, so two companies hiring for the same title both get posted
+    slug = re.sub(r"[^a-z0-9]+", "-", f"{title} {company}".lower()).strip("-")[:80].strip("-") or "job"
+    try:
+        r = requests.get(WP_JOBS_URL, params={"slug": slug}, headers=wp_headers(), timeout=15,
+                         verify=WP_VERIFY)
+        posts = r.json() if r.status_code == 200 else None
+        if isinstance(posts, list) and posts:
+            return posts[0].get("id"), posts[0].get("link"), ""          # already on WordPress
+    except Exception:
+        pass
+
+    raw_type = (job["jobType"] or "full-time").lower().strip()
+    job_type = JOB_TYPE_MAPPING.get(raw_type, "full-time")
+    application = job["application"]
+    if not (re.match(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$", application)
+            or re.match(r"^https?://\S+$", application)):
+        application = job["jobUrl"]                          # last resort: the job's source page
+
+    attachment_id = wp_upload_logo(job["companyLogo"], company)
+    region_id = wp_term_id(f"{WP_BASE}/job_listing_region", job["jobLocation"])
+    type_id = wp_term_id(f"{WP_BASE}/job_listing_type", job_type.replace("-", " ").title())
+
+    payload = {
+        "title": title, "slug": slug, "content": description, "status": "publish",
+        "featured_media": attachment_id or 0,
+        "meta": {
+            "_job_title": title,
+            "_job_location": job["jobLocation"],
+            "_job_type": job_type,
+            "_job_description": description,
+            "_application": application,
+            "_company_url": job["companyUrl"],
+            "_job_expires": job["deadline"] or job["estimatedDeadline"],
+            "_company_name": company,
+            "_company_website": job["companyWebsite"],
+            "_company_logo": str(attachment_id) if attachment_id else "",
+            "_company_address": job["companyAddress"],
+            "_company_details": job["companyDetails"],
+            "_company_industry": job["companyIndustry"],
+            "_company_founded": job["companyFounded"],
+            "_company_type": job["companyType"],
+            "_job_qualifications": job["jobQualifications"],
+            "_job_experiences": job["jobExperience"],
+            "_job_field": job["jobField"],
+            "_job_salary": job["salaryRange"],
+        },
+    }
+    if region_id:
+        payload["job_listing_region"] = [region_id]
+    if type_id:
+        payload["job_listing_type"] = [type_id]
+
+    last_err = ""
+    for attempt in range(3):
+        try:
+            r = requests.post(WP_JOBS_URL, json=payload, headers=wp_headers(), timeout=30,
+                              verify=WP_VERIFY)
+            if r.status_code in (200, 201):
+                try:
+                    post = r.json()
+                except ValueError:
+                    return None, None, "WordPress answered 200 but not with JSON (wrong WP_BASE_URL?)"
+                return post.get("id"), post.get("link"), ""
+            last_err = wp_error_text(r)
+            if r.status_code < 500 and r.status_code != 429:
+                break                                          # retrying will not help
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(2 ** attempt)
+    return None, None, last_err
+
+
+def to_wp_job(j):
+    """Internal job dict -> the camelCase dict used for WordPress and for the Excel file."""
+    return {
+        "jobTitle": j["title"], "jobType": j["job_type_mapped"],
+        "jobQualifications": j["qualification"], "jobExperience": j["experience"],
+        "jobLocation": j["location"], "jobField": j["job_field"],
+        "datePosted": j["date_posted"], "deadline": j["deadline"],
+        "estimatedDeadline": j["estimated_deadline"],
+        "jobDescription": j["description"],
+        # public email / external link, else the job's own page on the source site
+        "application": j["apply_email"] or j["apply_url"] or j["job_url"],
+        "companyUrl": j.get("company_url", "") or j["company_website"],
+        "companyName": j["company"], "companyLogo": j["logo"],
+        "companyIndustry": j["company_industry"], "companyFounded": j["company_founded"],
+        "companyType": j["company_type"], "companyWebsite": j["company_website"],
+        "companyAddress": j["company_address"], "companyDetails": j["company_about"],
+        "jobUrl": j["job_url"], "salaryRange": j["salary"],
+    }
+
+
+def _xlsx_cell(v):
+    return _ILLEGAL_XLSX_RE.sub("", str(v if v is not None else ""))[:32000]
+
+
+def _save_excel(jobs):
+    if not jobs:
+        return
+    if openpyxl is None:
+        print("  openpyxl is not installed: Excel file skipped (pip install openpyxl)")
+        return
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = SHEET_NAME
+    ws.append(EXCEL_HEADERS)
+    for job in jobs:
+        ws.append([_xlsx_cell(v) for v in (
+            job["jobTitle"], job["jobType"], job["jobQualifications"], job["jobExperience"],
+            job["jobLocation"], job["jobField"], job["datePosted"], job["deadline"],
+            job["jobDescription"], job["application"], job["companyUrl"], job["companyName"],
+            job["companyLogo"], job["companyIndustry"], job["companyFounded"],
+            job["companyType"], job["companyWebsite"], job["companyAddress"],
+            job["companyDetails"], job["jobUrl"], job["estimatedDeadline"], job["salaryRange"])])
+    wb.save(OUTPUT_FILE)
+    print(f"  Saved {len(jobs)} rows -> {OUTPUT_FILE}")
+
+
+# ----------------------------------------------------------------------------
 # RUNNER
 # ----------------------------------------------------------------------------
 def run_source(key, seen_urls, fps, all_rows):
@@ -2438,8 +2728,12 @@ def run_source(key, seen_urls, fps, all_rows):
     print("\n" + "=" * 70)
     print(f"  SOURCE: {src['name'].upper()}")
     print("=" * 70)
-    stats = {"new": 0, "skipped": 0, "dupes": 0, "errors": 0}
+    stats = {"new": 0, "skipped": 0, "dupes": 0, "errors": 0, "posted": 0}
 
+    if WP_ENABLED and WP_STATE["down"]:
+        print("  WordPress posting stopped earlier in this run, so this source is skipped "
+              "(its jobs are not marked as scraped and will be tried again next run).")
+        return stats
     try:
         links = src["collect"](seen_urls)
     except Exception as e:
@@ -2490,8 +2784,30 @@ def run_source(key, seen_urls, fps, all_rows):
             seen_urls.add(link)
             continue
 
+        wp_job = to_wp_job(job)
+        wp_id = None
+        if WP_ENABLED:
+            wp_id, _wp_link, wp_err = post_job_to_wordpress(wp_job)
+            if not wp_id:
+                # not saved and not marked as seen, so the next run tries this job again
+                stats["errors"] += 1
+                WP_STATE["fail_streak"] += 1
+                print(f"  WP POST FAILED ({wp_err}): {job['title']}")
+                if WP_STATE["fail_streak"] >= WP_MAX_FAIL_STREAK:
+                    WP_STATE["down"] = True
+                    print(f"\n  {WP_STATE['fail_streak']} WordPress posts failed in a row: "
+                          f"stopping the whole run. Fix the error above and run again.")
+                    break
+                time.sleep(src["delay"]())
+                continue
+            WP_STATE["fail_streak"] = 0
+            stats["posted"] += 1
+
         row = to_row(job, src["name"])
         append_csv(row)
+        EXCEL_JOBS.append(wp_job)
+        if len(EXCEL_JOBS) % 25 == 0:
+            _save_excel(EXCEL_JOBS)
         mark_seen(link)
         seen_urls.add(link)
         if fp:
@@ -2501,7 +2817,7 @@ def run_source(key, seen_urls, fps, all_rows):
         stats["new"] += 1
         apply = job["apply_email"] or job["apply_url"] or "source url (no public apply)"
         print(f"  [{stats['new']}] {job['title']} | {job['company']} | "
-              f"{job['location']} | apply: {apply}")
+              f"{job['location']} | apply: {apply}" + (f" | WP #{wp_id}" if wp_id else ""))
 
         if JOB_LIMIT and stats["new"] >= JOB_LIMIT:
             print(f"\n  JOB_LIMIT ({JOB_LIMIT}) reached for {src['name']}, stopping.")
@@ -2537,6 +2853,10 @@ def main():
     print(f"  JOBS SCRAPER  ->  {', '.join(SOURCES[k]['name'] for k in keys)}")
     print("=" * 70)
 
+    if WP_ENABLED:
+        print(f"WordPress posting: ON  -> {WP_JOBS_URL}")
+    else:
+        print("WordPress posting: OFF (missing: " + ", ".join(wp_missing_settings()) + ")")
     seen_urls, fps = load_seen()
     print(f"Already scraped before: {len(seen_urls)} job(s)")
 
@@ -2546,18 +2866,19 @@ def main():
             totals[key] = run_source(key, seen_urls, fps, all_rows)
         except Exception as e:                      # one source must never stop the others
             print(f"  SOURCE {key} CRASHED: {e}")
-            totals[key] = {"new": 0, "skipped": 0, "dupes": 0, "errors": 1}
+            totals[key] = {"new": 0, "skipped": 0, "dupes": 0, "errors": 1, "posted": 0}
 
     with open(JSON_FILE, "w", encoding="utf-8") as f:
         json.dump(all_rows, f, ensure_ascii=False, indent=2)
+    _save_excel(EXCEL_JOBS)
 
     print("\n" + "=" * 70)
     for key in keys:
         s = totals[key]
         print(f"  {SOURCES[key]['name']:20} new {s['new']:4} | skipped {s['skipped']:4} | "
-              f"duplicates {s['dupes']:4} | errors {s['errors']}")
+              f"duplicates {s['dupes']:4} | posted {s['posted']:4} | errors {s['errors']}")
     print(f"  Total new: {len(all_rows)}")
-    print(f"  Files: {CSV_FILE}, {JSON_FILE}, {SEEN_FILE}")
+    print(f"  Files: {CSV_FILE}, {JSON_FILE}, {SEEN_FILE}, {OUTPUT_FILE}")
     print("=" * 70)
 
 
