@@ -65,6 +65,11 @@ WordPress posting (every new job is posted straight to WordPress as it is scrape
     If any of the three required settings is missing, posting is switched off and the
     script only writes the CSV / JSON / Excel files.
     OUTPUT_FILE          Excel file for this run's jobs (default scraped_jobs.xlsx)
+
+Verbose output (on by default): every job is printed in full before it is posted, and the
+WordPress result (ID + link) is printed after it.
+    VERBOSE              0 = only one short line per job (default 1)
+    VERBOSE_DESC_CHARS   characters of the description to show (default 600, 0 = all of it)
 """
 import base64
 import csv
@@ -153,6 +158,9 @@ JOB_TYPE_MAPPING = {
     "volunteer": "volunteer", "permanent": "full-time",
     "full-timer": "full-time", "full timer": "full-time",
 }
+
+VERBOSE = os.environ.get("VERBOSE", "1") != "0"
+VERBOSE_DESC_CHARS = int(os.environ.get("VERBOSE_DESC_CHARS", "600") or 0)
 
 # ---- Excel ----
 OUTPUT_FILE = os.environ.get("OUTPUT_FILE", "scraped_jobs.xlsx")
@@ -2720,6 +2728,46 @@ def _save_excel(jobs):
     print(f"  Saved {len(jobs)} rows -> {OUTPUT_FILE}")
 
 
+def print_job_verbose(num, source_name, wp_job, job):
+    """Everything that is about to be saved / posted for one job."""
+    def show(label, value):
+        print(f"  {label:<22}: {value if value not in (None, '') else '-'}")
+
+    desc = wp_job["jobDescription"]
+    if VERBOSE_DESC_CHARS and len(desc) > VERBOSE_DESC_CHARS:
+        desc = desc[:VERBOSE_DESC_CHARS].rstrip() + f" [... {len(wp_job['jobDescription'])} chars in total]"
+    bar = "-" * 78
+    print("\n" + bar)
+    print(f"  JOB #{num}   source: {source_name}")
+    print(bar)
+    show("Title", wp_job["jobTitle"])
+    show("Job type", f"{wp_job['jobType']}   (site said: {job.get('job_type') or '-'})")
+    show("Field", wp_job["jobField"])
+    show("Location", wp_job["jobLocation"])
+    show("Qualification", wp_job["jobQualifications"])
+    show("Experience", wp_job["jobExperience"])
+    show("Salary", wp_job["salaryRange"])
+    show("Posted", wp_job["datePosted"])
+    show("Deadline", wp_job["deadline"])
+    show("Estimated deadline", wp_job["estimatedDeadline"])
+    kind = ("email" if job["apply_email"] else "external link" if job["apply_url"]
+            else "source page (no public apply found)")
+    show("Application", f"{wp_job['application']}   <- {kind}")
+    print("  --- company ---")
+    show("Name", wp_job["companyName"])
+    show("Website", wp_job["companyWebsite"])
+    show("Company URL", wp_job["companyUrl"])
+    show("Industry", wp_job["companyIndustry"])
+    show("Type / founded", f"{wp_job['companyType'] or '-'} / {wp_job['companyFounded'] or '-'}")
+    show("Address", wp_job["companyAddress"])
+    show("Logo", wp_job["companyLogo"])
+    show("About", (wp_job["companyDetails"] or "")[:200])
+    print("  --- description ---")
+    print("  " + (desc.replace("\n", "\n  ") if desc else "-"))
+    show("Job URL", wp_job["jobUrl"])
+    print(bar)
+
+
 # ----------------------------------------------------------------------------
 # RUNNER
 # ----------------------------------------------------------------------------
@@ -2786,8 +2834,12 @@ def run_source(key, seen_urls, fps, all_rows):
 
         wp_job = to_wp_job(job)
         wp_id = None
+        if VERBOSE:
+            print_job_verbose(stats["new"] + 1, src["name"], wp_job, job)
         if WP_ENABLED:
-            wp_id, _wp_link, wp_err = post_job_to_wordpress(wp_job)
+            if VERBOSE:
+                print("  >> posting to WordPress ...")
+            wp_id, wp_link, wp_err = post_job_to_wordpress(wp_job)
             if not wp_id:
                 # not saved and not marked as seen, so the next run tries this job again
                 stats["errors"] += 1
@@ -2802,6 +2854,10 @@ def run_source(key, seen_urls, fps, all_rows):
                 continue
             WP_STATE["fail_streak"] = 0
             stats["posted"] += 1
+            if VERBOSE:
+                print(f"  >> POSTED: WP ID {wp_id}   {wp_link or ''}")
+        elif VERBOSE:
+            print("  >> WordPress posting is OFF: saved to files only")
 
         row = to_row(job, src["name"])
         append_csv(row)
@@ -2813,6 +2869,8 @@ def run_source(key, seen_urls, fps, all_rows):
         if fp:
             mark_seen("fp:" + fp)
             fps.add(fp)
+        if VERBOSE:
+            print(f"  >> saved to {CSV_FILE} (Excel: {OUTPUT_FILE})")
         all_rows.append(row)
         stats["new"] += 1
         apply = job["apply_email"] or job["apply_url"] or "source url (no public apply)"
